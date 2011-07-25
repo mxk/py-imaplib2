@@ -1,0 +1,402 @@
+
+
+
+                     New IMAP4rev1 library for Python 3.2+
+                        Maxim Khitrov <max@mxcrypt.com>
+                                  24 July 2011
+
+
+
+ABSTRACT
+========
+
+The imaplib2 library provides a complete implementation of the IMAP4rev1
+protocol described in [RFC-3501], as well as over a dozen additional extensions.
+The implementation supports all existing features of imaplib and makes several
+improvements, which simplify the task of implementing an IMAP4 client
+application and provide access to more advanced protocol features.
+
+
+RATIONALE
+=========
+
+The existing imaplib module implements a subset of the older [RFC-2060]
+protocol, and opts for simplicity in handling server responses by delegating
+most of the parsing work to the caller. This makes writing an IMAP4 client
+application more difficult, because the developer must first understand the
+nuances of what servers are allowed to send and when.
+
+The protocol explicitly allows servers to send unrequested (unilateral) data to
+the client at any time. Servers may inject additional information into a
+response, such as an unrequested FLAGS attribute for a FETCH command, which may
+happen if the mailbox is opened by multiple clients. The data for a single
+message may also be split into several responses at the server's discretion. All
+of these permutations have the potential to cause problems for application code
+written to expect a particular form of a response in order to parse it using
+regular expressions.
+
+For more advanced use cases, the features missing from the existing library
+impact the overall application performance by preventing client applications
+from issuing multiple commands or processing server responses in an asynchronous
+fashion. These features cannot be easily added to imaplib, because they go
+against the existing command interface.
+
+The new library attempts to correct these issues by providing a redesigned
+interface for sending commands to the server and processing responses. It also
+contains several utility functions for encoding and decoding various types of
+data. The implementation closely follows [RFC-3501], which obsoletes [RFC-2060].
+A list of differences between the two is available at:
+
+* http://tools.ietf.org/html/rfc3501#appendix-B
+
+The following is an outline of the major additions and improvements made in the
+new library:
+
+* Server response parser. The parser implements proper handling for all IMAP4
+  data types, including quoted strings, literals, nested parenthesized lists,
+  numbers, atoms, and NILs. The final output is presented to the user as a list
+  of decoded tokens with several attributes to help identify the response type
+  and destination (see the next section for examples).
+
+* Concurrent command execution. With the exception of a few commands (e.g.
+  STARTTLS), the protocol allows the client to issue multiple commands at the
+  same time whenever there is no ambiguity in expected responses. This is not
+  possible in imaplib, but could be useful for improving performance or
+  interactivity in some client applications.
+
+* Data compression. The COMPRESS extension [RFC-4978] is fully supported, which
+  allows the incoming and outgoing data streams to be compressed using zlib's
+  DEFLATE algorithm. This has a huge impact on the total amount of data
+  transferred in a single session (e.g. a complete download of a 3 GB mailbox
+  results in a transfer of just 986 MB).
+
+* Access to received data while a command is in progress (aka asynchronous
+  execution). Some commands, such as FETCH, may run for several minutes while
+  the server locates the requested data and sends it to the client. In these
+  instances, there is a significant performance benefit in processing the
+  responses as they are coming in, as opposed to buffering everything in memory.
+  Some commands, such as IDLE [RFC-2177], can only operate asynchronously, which
+  requires library support for response polling.
+
+* UTF-7 mailbox name codec. IMAP4 uses a modified UTF-7 encoding for mailbox
+  names containing non-ASCII characters. Python has no existing method of
+  decoding this format, which is different from [RFC-2152] and 'utf_7' codec.
+  Two new functions have been added to encode and decode this format, and the
+  encoder is called automatically by the library for all commands expecting a
+  mailbox name as input.
+
+* Support for multiple literals in commands. [RFC-3501] section 7.5 shows an
+  example of a LOGIN command containing two literals, which could be necessary
+  when username and password use 8-bit characters. Other commands may also
+  contain multiple literals, which is not supported by imaplib. The new library
+  correctly handles any number of literals in the command by treating strings as
+  ASCII text and bytes as literal data. Commands like LOGIN automatically
+  convert their arguments into the literal form if they contain non-ASCII
+  characters. The library also supports LITERAL+ extension [RFC-2088], which
+  permits the client to begin sending the next literal without waiting for a go
+  ahead from the server.
+
+* Many additional extensions have been implemented to support the features
+  available in modern IMAP4 servers. The full list of RFCs is at the top of
+  imaplib2.py.
+
+
+IMPLEMENTATION
+==============
+
+This section describes the core classes of the imaplib2 module:
+
+* IMAP4
+* IMAP4Command
+* IMAP4Response
+* IMAP4SeqSet
+
+IMAP4
+-----
+
+A connection to the server is established by creating a new IMAP4 class
+instance. The resulting object supports the context management protocol, which
+automatically performs a graceful logout upon leaving the context:
+
+    from imaplib2 import *
+
+    with IMAP4('host:port', timeout=30) as imap:
+        ...
+
+    # ^ Can also be written as:
+    imap = IMAP4(('host', port), timeout=30)
+    try:
+        ...
+    finally:
+        imap.logout()
+
+The library takes care of most protocol details, such as maintaining the current
+connection state (available via the 'imap.state' property), automatically
+updating server capabilities when necessary, and monitoring various error
+conditions, such as an unexpected BYE response (server closing the connection).
+This mirrors the behavior of imaplib. The interface for issuing commands is also
+very similar or even identical, depending on the command:
+
+    imap.login('username', 'password')
+    imap.select('INBOX', readonly=True)
+    ...
+
+SSL/TLS encryption with optional certificate verification is enabled by
+providing an ssl.SSLContext object either to the IMAP4 constructor or the
+STARTTLS command:
+
+    from imaplib2 import *
+
+    # Raise SSLError if certificate verification fails
+    ctx = ssl_context(ssl.CERT_REQUIRED, '/path/to/cafile')
+
+    # Use SSL (default port 993 is used)
+    with IMAP4('imap.example.com', ssl_ctx=ctx) as imap:
+        imap.login('username', 'my plaintext password')  # Encrypted
+        ...
+
+    # Use TLS (default port 143 is used)
+    with IMAP4('imap.example.com') as imap:
+        imap.noop()                                      # Not encrypted
+        imap.starttls(ctx)
+        imap.login('username', 'my plaintext password')  # Encrypted
+        ...
+
+The differences between the two libraries become more apparent after a command
+is issued. First, the library maintains stricter control over what the client is
+permitted to send at any given time. For example, the LOGIN command will not be
+sent if the server is advertising LOGINDISABLED capability, as required by
+[RFC-3501]. This is an important security consideration. Second, most command
+methods gained a new 'wait' keyword argument, which allows the user to execute
+commands asynchronously. This flag is set to True by default, which blocks the
+caller until the entire command is finished (same as imaplib). By specifying
+'wait=False', control is returned to the caller as soon as the command is sent
+to the server. For example:
+
+    # This loop will wait for all message bodies to be buffered in memory before
+    # the first iteration takes place.
+    for resp in imap.fetch('1:*', 'BODY[]'):
+        ...
+
+    # This loop will run as soon as the first message body is received.
+    for resp in imap.fetch('1:*', 'BODY[]', wait=False):
+        ...
+
+The first mode of operation is the only one implemented by imaplib. Running this
+FETCH command for all messages in the mailbox ('1:*') is probably a bad idea,
+because the library may end up buffering hundreds of megs in memory before
+processing anything.
+
+The asynchronous approach is an improvement, because it provides access to each
+server response as soon as it is received. The application is able to process
+one response at a time, allowing the allocated memory to be freed by the time
+the next response is received. This improves the overall performance by
+interleaving I/O- and CPU-bound tasks (especially if response processing can be
+delegated to another thread or process) and keeps memory usage under control.
+
+IMAP4Command
+------------
+
+A minor code adjustment is necessary when running commands asynchronously. In
+synchronous mode, imaplib2 will raise an exception whenever the server returns
+NO or BAD command completion codes. This is true for all commands. In
+asynchronous mode, the completion code is unknown while responses are being
+processed, so the user is expected to make an extra call to the 'check()' method
+at the end of the loop to verify successful command completion. This also allows
+the user to decide which completion codes should be treated as errors. The
+asynchronous example above is modified as follows:
+
+    # This loop will run as soon as the first message body is received.
+    cmd = imap.fetch('1:*', 'BODY[]', wait=False)
+    for resp in cmd:
+        ...
+    cmd.check()  # or cmd.check('OK'[, 'NO'[, 'BAD']])
+
+Calling 'cmd.check()' or 'cmd.check("OK")' will raise an exception if the
+command completed with a status code other than OK. Sometimes, NO may also be an
+acceptable completion result, such as when a long-running FETCH fails to locate
+the data or attributes of one or two messages. This is usually a temporary error
+condition, which does not invalidate the data or attributes returned for all
+other FETCHed messages. In this case, the user would call
+'cmd.check("OK", "NO")' to indicate that either response code is acceptable (BAD
+will still raise an exception).
+
+The last example made explicit the fact that executing any command causes an
+IMAP4Command instance to be returned. This is a major departure from imaplib,
+which would return a tuple '(type, [data, ...])'. The IMAP4Command class
+provides all the tools necessary for controlling command execution, receiving
+and filtering responses, and determining the final command result. It is also
+the base class used for implementing custom commands outside of the library.
+
+Server responses are read from the socket by calling IMAP4.__next__ method. This
+means that the user is able to monitor all responses in the order they were sent
+simply by iterating over the original 'imap' object:
+
+    imap.fetch('1:*', 'BODY[]', wait=False)
+    for resp in imap:
+        ...  # resp could be a FETCH response or anything else the server sends
+
+Receiving data in this fashion is possible, but could be error-prone, because
+the IMAP4 protocol explicitly permits the server to send unilateral responses
+that do not belong to any command in progress (e.g. informing the client of a
+new message delivered to the current mailbox). The IMAP4Command class provides a
+way to retrieve only those responses that are expected. To achieve this, each
+command instance has a 'queue' attribute, which is implemented as a deque
+instance. Whenever a response is received by calling IMAP4.__next__, the library
+allows one of the active commands to claim the response, which is appended to
+that command's queue. Unclaimed responses are placed on the common or
+"unclaimed" queue, which is an OrderedDict instance accessible via the
+'IMAP4.queue' attribute. The common queue is typically consumed by the NOOP
+command, like so:
+
+    # Defer all SELECT responses to the common queue for later processing
+    imap.select('INBOX').defer()
+
+    # Long-running FETCH command
+    cmd = imap.fetch(range(1, 1001), 'FULL', wait=False)
+    for resp in cmd:
+        ... # resp is guaranteed to be a FETCH response for messages 1:1000
+    cmd.check()
+
+    assert len(cmd.queue)  == 0  # All FETCH responses were processed
+    assert len(imap.queue) != 0  # SELECT responses are still waiting
+
+    # Process all SELECT responses and anything else the server sends
+    for resp in imap.noop():
+        ... # resp could be anything
+
+    assert len(imap.queue) == 0
+
+IMAP4Response
+-------------
+
+The third major component of the new library is the IMAP4Response class, an
+instance of which was being returned in all previous examples when iterating
+over IMAP4 or IMAP4Command instances. The command completion response is also
+assigned to 'IMAP4Command.result' attribute as soon as the command is finished.
+This class is responsible for parsing and decoding server responses into a form
+that is much more convenient to use in Python. Rather than explaining the parser
+in great detail, here are a few examples of how server responses are converted
+to IMAP4Response objects (formatted for clarity):
+
+    >>> IMAP4Response('* OK Hello, this is a server greeting...')
+    IMAP4Response(
+        seq=1,
+        type='status',
+        tag='*',
+        status='OK',
+        info='Hello, this is a server greeting...',
+        dtype=None,
+        data=()
+    )
+
+    >>> IMAP4Response('* THIS IS A ((DATA RESPONSE) 123 "QUOTED STRING")')
+    IMAP4Response(
+        seq=2,
+        type='data',
+        tag='*',
+        status=None,
+        info=None,
+        dtype='THIS',
+        data=('THIS', 'IS', 'A', [['DATA', 'RESPONSE'], 123, 'QUOTED STRING'])
+    )
+
+    # This is an internal representation of literals used by the library
+    >>> IMAP4Response('* DATA {0} CONTAINING {1}', [b'RESPONSE', b'LITERALS'])
+    IMAP4Response(
+        seq=3,
+        type='data',
+        tag='*',
+        status=None,
+        info=None,
+        dtype='DATA',
+        data=('DATA', b'RESPONSE', 'CONTAINING', b'LITERALS')
+    )
+
+    >>> IMAP4Response('TAG1 BAD [TRYCREATE] APPEND command failed')
+    IMAP4Response(
+        seq=4,
+        type='done',
+        tag='TAG1',
+        status='BAD',
+        info='APPEND command failed',
+        dtype='TRYCREATE',
+        data=('TRYCREATE',)
+    )
+
+    >>> IMAP4Response('+ Please continue...')
+    IMAP4Response(
+        seq=5,
+        type='continue',
+        tag='+',
+        status=None,
+        info='Please continue...',
+        dtype=None,
+        data=()
+    )
+
+In essence, the parser determines what 'type' of a response was just received
+(status, data, done, or continue), extracts and decodes all of its components,
+and assigns them to 'tag', 'status', 'info', and 'dtype' attributes. The
+IMAP4Response class is actually a subclass of the built-in list type, so the
+'data' attribute above shows the contents of the underlying list object. The
+first text data item is copied to the 'dtype' attribute in order to help
+identify which command this response belongs to. For example, the response
+
+    * list (\hasnochildren) "/" "INBOX"
+
+will have 'dtype' set to 'LIST' (note the case change; the protocol is case-
+insensitive, so dtype is always converted to upper case). While the response
+
+    * 1 fetch (uid 123)
+
+will have 'dtype' set to 'FETCH', even though it's not the first data item.
+
+The 'status' attribute is only set for responses beginning with OK, NO, BAD,
+PREAUTH, or BYE. The 'info' attribute will contain the associated human-readable
+explanation of the status. If an optional response code is present (e.g.
+"[TRYCREATE]" in response 4 above), it will be decoded into the parent list
+object and 'dtype' will be assigned the same way as for a data response.
+
+All responses are assigned unique sequence IDs in the 'seq' attribute, which is
+used to maintain their order in the unclaimed IMAP4 response queue.
+
+IMAP4SeqSet
+-----------
+
+The final library component is the IMAP4SeqSet class, which may be used
+implicitly or explicitly to represent a set of message sequence numbers or UIDs.
+It is a subclass of the built-in set type and provides the ability to encode and
+decode sequence set strings such as '1,3,5:10,20:30'. Explicit use is when the
+caller passes an IMAP4SeqSet instance as the first parameter to the FETCH,
+STORE, or COPY commands. The class is used implicitly when the caller passes any
+other Python sequence object containing integers. The following three FETCH
+commands are all identical:
+
+    imap.fetch((1, 2, 3, 4, 5, 10), 'FAST')
+    imap.fetch(IMAP4SeqSet('1:5,10'), 'FAST')
+
+    seqset = IMAP4SeqSet('10')
+    seqset.update(range(1, 6))
+
+    assert 2 in seqset
+    assert str(seqset) == '1:5,10'
+
+    imap.fetch(seqset, 'FAST')
+
+One limitation of the IMAP4SeqSet is that it cannot be used for an indeterminate
+range, such as '1:*'. As a result, passing a string as the first argument will
+not cause a new IMAP4SeqSet instance to be created:
+
+    imap.fetch('1:5,*', 'FAST')
+
+This has one additional downside, in that all of the following responses would
+be claimed by the above command, since the library has no idea what message '*'
+refers to (in the IMAP4 protocol 'N:*' and '*:N' are identical and always match
+the last message in the mailbox):
+
+    * 1 FETCH (...)
+    * 5 FETCH (...)
+    * 7 FETCH (...)
+    * 10 FETCH (...)
+    * 99 FETCH (...)
