@@ -39,6 +39,7 @@ Informational RFCs:
 TODO:
 
 * http://tools.ietf.org/html/rfc1731 - IMAP4 Authentication Mechanisms
+* http://tools.ietf.org/html/rfc2831 - Digest SASL Mechanism
 * http://tools.ietf.org/html/rfc4469 - IMAP CATENATE Extension
 * http://tools.ietf.org/html/rfc5258 - IMAP4 LIST Command Extensions
 * http://tools.ietf.org/html/rfc5267 - IMAP CONTEXT
@@ -430,6 +431,7 @@ class IMAP4:
 		self.readonly = None   # Mailbox read/write status in 'selected' state
 		self._sock    = None   # IMAP4Socket instance
 		self._state   = None   # Connection state (one of _all_states)
+		self.monitor  = None   # Response monitor function
 
 		self.cmds  = OrderedDict()  # Commands in progress
 		self.queue = OrderedDict()  # Unclaimed response queue
@@ -561,6 +563,8 @@ class IMAP4:
 				raise
 
 			rsp = IMAP4Response(text, data)
+			if self.monitor and not self.monitor(rsp):
+				continue
 			if rsp.type == 'continue':
 				return rsp
 			if rsp.dtype == 'CAPABILITY':
@@ -629,12 +633,12 @@ class IMAP4:
 		queue   = self.queue
 		new_seq = rsp.seq
 		max_seq = next(reversed(queue), new_seq)
+
 		queue[new_seq] = rsp
 
 		# Preserve response order
 		if new_seq < max_seq:
-			older = [seq for seq in queue if seq > new_seq]
-			for seq in older:
+			for seq in [seq for seq in queue if seq > new_seq]:
 				queue.move_to_end(seq)
 
 	def wait_all(self):
@@ -644,6 +648,21 @@ class IMAP4:
 				raise RuntimeError("cannot wait for 'IDLE' to finish")
 			_debug3('Waiting for {}({}) to finish...', cmd.full_name, cmd.tag)
 			self._wait(cmd)
+
+	def set_monitor(self, callback):
+		"""Set or clear a monitor function that is called for each response.
+
+		The monitor function is called immediately after receiving and parsing
+		each response. It is expected to return True to proceed with normal
+		response handling or False to 'forget' about the response. Returning
+		False for command completion or continuation requests could break
+		library operation.
+		"""
+		if not callable(callback):
+			raise TypeError('monitor function is not callable')
+		prev = self.monitor
+		self.monitor = callback
+		return prev
 
 	#
 	# 6.1 Client Commands - Any State
