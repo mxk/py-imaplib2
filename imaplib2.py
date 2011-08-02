@@ -2208,7 +2208,8 @@ class IMAP4Socket:
 		if sock.fileno() < 0:
 			return
 		try:
-			sock.shutdown(socket.SHUT_RDWR)
+			if sys.exc_info()[0] is not socket.error:
+				sock.shutdown(socket.SHUT_RDWR)
 		except socket.error as exc:
 			if exc.errno != errno.ENOTCONN:
 				raise
